@@ -35,6 +35,7 @@ def cmd_train(args):
         output_dir         = args.output_dir,
         hf_token           = args.hf_token,
         cache_dir          = args.cache_dir,
+        local_model_dir    = args.local_model_dir,
         literature_data    = args.literature_data,
         general_data       = args.general_data,
         num_epochs         = args.epochs,
@@ -156,6 +157,11 @@ def main():
         "--cache_dir",
         default=None,
         help="Directory to cache downloaded model weights (default: ~/.cache/huggingface)",
+    )
+    p_train.add_argument(
+        "--local_model_dir",
+        default="./models",
+        help="Directory to save the model locally before training (default: ./models)",
     )
     p_train.add_argument("--output_dir",     default="./output")
     p_train.add_argument("--literature_data",default=None,  help="JSONL file")
