@@ -63,6 +63,7 @@ class TrainConfig:
     output_dir:         str  = "./output"
     hf_token:  Optional[str] = None
     cache_dir: Optional[str] = None
+    local_model_dir:    str  = "./models"
 
     # ── Memory-saving flags (all ON by default for 8 GB GPUs) ────────────────
     use_4bit:               bool = True   # load base model in NF4 4-bit
@@ -193,16 +194,57 @@ class DualObjectiveQATTrainer:
                     "  https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct\n"
                 )
 
+    # ── Download model locally ────────────────────────────────────────────────
+    def _download_model_locally(self) -> str:
+        """Download model and tokenizer from HuggingFace and save to a local
+        directory.  Returns the local path.  If the model already exists
+        locally (or is already a local path), this is a no-op."""
+        model_id = self.cfg.model_name_or_path
+
+        if os.path.isdir(model_id):
+            log.info(f"Model path is already local: {model_id}")
+            return model_id
+
+        safe_name = model_id.replace("/", "--")
+        local_path = os.path.join(self.cfg.local_model_dir, safe_name)
+
+        if os.path.isdir(local_path) and any(
+            f.endswith((".bin", ".safetensors")) for f in os.listdir(local_path)
+        ):
+            log.info(f"Local copy already exists at {local_path}, skipping download")
+            return local_path
+
+        log.info(f"Downloading {model_id} → {local_path} ...")
+        os.makedirs(local_path, exist_ok=True)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id, cache_dir=self.cfg.cache_dir,
+        )
+        tokenizer.save_pretrained(local_path)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype       = torch.bfloat16,
+            cache_dir         = self.cfg.cache_dir,
+            low_cpu_mem_usage = True,
+        )
+        model.save_pretrained(local_path)
+        del model
+        torch.cuda.empty_cache()
+
+        log.info(f"Model saved locally at {local_path}")
+        return local_path
+
     # ── Model loading ─────────────────────────────────────────────────────────
     def _load_model(self):
         self._hf_authenticate()
-        model_id = self.cfg.model_name_or_path
-        log.info(f"Loading: {model_id}")
+
+        local_path = self._download_model_locally()
+        log.info(f"Loading model from local path: {local_path}")
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            cache_dir    = self.cfg.cache_dir,
+            local_path,
             padding_side = "right",
         )
         if self.tokenizer.pad_token is None:
@@ -222,13 +264,12 @@ class DualObjectiveQATTrainer:
             bnb_cfg = None
             log.info("Base model: bf16  (~6 GB)")
 
-        # Load base model
+        # Load base model from local path
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            local_path,
             quantization_config = bnb_cfg,
             torch_dtype         = torch.bfloat16,
             device_map          = "auto",
-            cache_dir           = self.cfg.cache_dir,
             low_cpu_mem_usage   = True,
         )
 
@@ -507,8 +548,11 @@ class DualObjectiveQATTrainer:
         path = os.path.join(self.cfg.output_dir, f"checkpoint-{tag}")
         os.makedirs(path, exist_ok=True)
 
-        if self.cfg.use_lora:
-            # Only saves the small LoRA delta weights (~50 MB vs ~6 GB)
+        if self.cfg.use_lora and tag == "final":
+            log.info("Merging LoRA adapters into base model for final save...")
+            merged = self.model.merge_and_unload()
+            merged.save_pretrained(path, safe_serialization=True)
+        elif self.cfg.use_lora:
             self.model.save_pretrained(path)
         else:
             state = {n: p.data.cpu() for n, p in self.model.named_parameters()}
